@@ -101,6 +101,9 @@
 //****************************************************************************
 
 #include "utils.h"
+#include <stdio.h>
+#define BLOCK_WIDTH 16
+#define FILTER_WIDTH 9
 
 __global__
 void gaussian_blur(const unsigned char* const inputChannel,
@@ -129,15 +132,20 @@ void gaussian_blur(const unsigned char* const inputChannel,
     // the value is out of bounds), you should explicitly clamp the neighbor values you read
     // to be within the bounds of the image. If this is not clear to you, then please refer
     // to sequential reference solution for the exact clamping semantics you should follow.
-
-
-    // calculate image index
-    int img_x = blockDim.x * blockIdx.x + threadIdx.x;
-    int img_y = blockDim.y * blockIdx.y + threadIdx.y;
+    int img_x = blockIdx.x * blockDim.x + threadIdx.x;
+    int img_y = blockIdx.y * blockDim.y + threadIdx.y;
     if(img_x >= numCols || img_y >= numRows)
     {
         return;
     }
+
+    __shared__ float s_filter[FILTER_WIDTH*FILTER_WIDTH];
+    if(threadIdx.x < FILTER_WIDTH && threadIdx.y < FILTER_WIDTH)
+    {
+        int index = threadIdx.y * FILTER_WIDTH + threadIdx.x;
+        s_filter[index] = filter[index];
+    }
+    __syncthreads();
 
     int half_width = filterWidth/2;
     float average = 0.0f;
@@ -145,8 +153,10 @@ void gaussian_blur(const unsigned char* const inputChannel,
     {
         for(int filter_c = -half_width; filter_c <= half_width; filter_c++)
         {
-            // find the offset row, clamp if needed
+            int img_c = img_x + filter_c;
             int img_r = img_y + filter_r;
+
+            // find the offset row, clamp if needed
             if(img_r < 0)
             {
                 img_r = 0;
@@ -157,7 +167,6 @@ void gaussian_blur(const unsigned char* const inputChannel,
             }
 
             // find the offset col, clamp if needed
-            int img_c = img_x + filter_c;
             if(img_c < 0)
             {
                 img_c = 0;
@@ -166,16 +175,15 @@ void gaussian_blur(const unsigned char* const inputChannel,
             {
                 img_c = numCols - 1;
             }
+            
+            int index = img_r * numCols + img_c;
+            float pixel = static_cast<float>(inputChannel[index]);
 
             // get the filter value
             int filter_x = filter_c + half_width;
             int filter_y = filter_r + half_width;
             int filterIdx = filter_y * filterWidth + filter_x;
-            float filterValue = filter[filterIdx];
-
-            // get the pixel value
-            int imageIdx = img_r * numCols + img_c;
-            float pixel = static_cast<float>(inputChannel[imageIdx]);
+            float filterValue = s_filter[filterIdx];
 
             // update average value
             float value = filterValue * pixel;
@@ -183,8 +191,8 @@ void gaussian_blur(const unsigned char* const inputChannel,
         }
     }
 
-    int index = img_y * numCols + img_x;
-    outputChannel[index] = average;
+    int inputIndex = img_y * numCols + img_x;
+    outputChannel[inputIndex] = average;
 }
 
 //This kernel takes in an image represented as a uchar4 and splits
@@ -292,8 +300,6 @@ void your_gaussian_blur(const uchar4 * const h_inputImageRGBA, uchar4 * const d_
                         unsigned char *d_blueBlurred,
                         const int filterWidth)
 {
-    int BLOCK_WIDTH = 16;
-
     //TODO: Set reasonable block size (i.e., number of threads per block)
     const dim3 blockSize(BLOCK_WIDTH, BLOCK_WIDTH);
 
