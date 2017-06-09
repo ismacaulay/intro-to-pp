@@ -78,8 +78,129 @@
   steps.
 
 */
-
 #include "utils.h"
+#include <stdio.h>
+
+void checkKernelErrors()
+{
+    checkCudaErrors(cudaPeekAtLastError());
+    checkCudaErrors(cudaDeviceSynchronize());
+}
+
+__global__
+void min_max_reduce_kernel(
+    const float* min_in, float* min_out, 
+    const float* max_in, float* max_out, 
+    const size_t n, const size_t shmOffset)
+{
+    extern __shared__ float s_data[];
+
+    float* s_min_data = s_data;
+    float* s_max_data = &s_data[shmOffset];
+
+    int threadId = threadIdx.x;
+    int left = blockIdx.x*(blockDim.x * 2) + threadId;
+    int right = left + blockDim.x;
+
+    s_min_data[threadId] = min(min_in[left], min_in[right]);
+    s_max_data[threadId] = max(max_in[left], max_in[right]);
+    __syncthreads();
+
+    for(unsigned int step = blockDim.x / 2; step > 0; step >>= 1)
+    {
+        if(threadId < step)
+        {
+            left = threadId;
+            right = threadId + step;
+
+            s_min_data[threadId] = min(s_min_data[left], s_min_data[right]);
+            s_max_data[threadId] = max(s_max_data[left], s_max_data[right]);
+        }
+        __syncthreads();
+    }
+
+    if(threadId == 0)
+    {
+        min_out[blockIdx.x] = s_min_data[threadId]; 
+        max_out[blockIdx.x] = s_max_data[threadId];
+    }
+}
+
+void reduce_min_max(const float* const d_logLuminance, 
+            const size_t numRows, const size_t numCols,
+            float& min_out, float& max_out)
+{
+    size_t threads = 256;
+    size_t maxBlocks = threads * 2;
+    size_t length = numRows * numCols;
+    size_t blocks = (length + (maxBlocks - 1))/maxBlocks;
+    size_t shmBytes = 2 * threads * sizeof(float);
+
+    float* d_min_in = NULL;
+    float* d_min_out = NULL;
+    checkCudaErrors(cudaMalloc(&d_min_in, length * sizeof(float)));
+    checkCudaErrors(cudaMemcpy(d_min_in, d_logLuminance, length * sizeof(float), cudaMemcpyDeviceToDevice));
+    checkCudaErrors(cudaMalloc(&d_min_out, blocks * sizeof(float)));
+    checkCudaErrors(cudaMemset(d_min_out, 0.0f, blocks * sizeof(float)));
+
+    float* d_max_in = NULL;
+    float* d_max_out = NULL;
+    checkCudaErrors(cudaMalloc(&d_max_in, length * sizeof(float)));
+    checkCudaErrors(cudaMemcpy(d_max_in, d_logLuminance, length * sizeof(float), cudaMemcpyDeviceToDevice));
+    checkCudaErrors(cudaMalloc(&d_max_out, blocks * sizeof(float)));
+    checkCudaErrors(cudaMemset(d_max_out, 0.0f, blocks * sizeof(float)));
+
+    min_max_reduce_kernel<<<blocks, threads, shmBytes>>>(
+        d_min_in, d_min_out, 
+        d_max_in, d_max_out, 
+        length, threads);
+    checkKernelErrors();
+
+    while(blocks >= 1)
+    {
+        length = blocks;
+        blocks = (length + ((threads*2) - 1))/(threads*2);
+        checkCudaErrors(cudaMemcpy(d_min_in, d_min_out, length * sizeof(float), cudaMemcpyDeviceToDevice));
+        checkCudaErrors(cudaMemcpy(d_max_in, d_max_out, length * sizeof(float), cudaMemcpyDeviceToDevice));
+
+        min_max_reduce_kernel<<<blocks, threads, shmBytes>>>(
+            d_min_in, d_min_out, 
+            d_max_in, d_max_out, 
+            length, threads);
+        checkKernelErrors();
+
+        if(blocks == 1)
+        {
+            break;
+        }
+    }
+
+    float min, max;
+    checkCudaErrors(cudaMemcpy(&min, d_min_out, 1*sizeof(float), cudaMemcpyDeviceToHost));
+    checkCudaErrors(cudaMemcpy(&max, d_max_out, 1*sizeof(float), cudaMemcpyDeviceToHost));
+
+    checkCudaErrors(cudaFree(d_min_in));
+    checkCudaErrors(cudaFree(d_min_out));
+    checkCudaErrors(cudaFree(d_max_in));
+    checkCudaErrors(cudaFree(d_max_out));
+
+    min_out = min;
+    max_out = max;
+}
+
+// #include <thrust/device_vector.h>
+// #include <thrust/transform_reduce.h>
+// #include <thrust/extrema.h>
+// float thrust_min(const float* const d_in, const size_t length)
+// {
+//     thrust::device_vector<float> d_x(d_in, d_in + length);
+//     return *thrust::min_element(d_x.begin(), d_x.end());
+// }
+// float thrust_max(const float* const d_in, const size_t length)
+// {
+//     thrust::device_vector<float> d_x(d_in, d_in + length);
+//     return *thrust::max_element(d_x.begin(), d_x.end());
+// }
 
 void your_histogram_and_prefixsum(const float* const d_logLuminance,
                                   unsigned int* const d_cdf,
@@ -100,5 +221,7 @@ void your_histogram_and_prefixsum(const float* const d_logLuminance,
        the cumulative distribution of luminance values (this should go in the
        incoming d_cdf pointer which already has been allocated for you)       */
 
-
+    reduce_min_max(d_logLuminance, numRows, numCols, min_logLum, max_logLum);
+    printf("min: %f max: %f\n", min_logLum, max_logLum);
+    // printf("max: %f max: %f\n", thrust_min(d_logLuminance, numRows * numCols), thrust_max(d_logLuminance, numRows * numCols)); 
 }
