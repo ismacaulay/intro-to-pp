@@ -91,21 +91,56 @@ __global__
 void min_max_reduce_kernel(
     const float* min_in, float* min_out, 
     const float* max_in, float* max_out, 
-    const size_t n, const size_t shmOffset)
+    const size_t n)
 {
     extern __shared__ float s_data[];
 
+    /*
+    shared memory size: 2 * #threads
+    
+    [------------------shared memory---------------------]
+    [--------min data---------][--------max data---------]
+    */
     float* s_min_data = s_data;
-    float* s_max_data = &s_data[shmOffset];
+    float* s_max_data = &s_data[blockDim.x];
 
+    /*
+    Allocate the shared memory using 2 * block size. This way we do the first reduction step
+    right now and process double the values per step.
+
+    Step 1:
+    [---------------------------------------in--------------------------------------]
+    [--------blockDim---------][--------blockDim---------]
+    [--------reduced shm------]
+    */
     int threadId = threadIdx.x;
     int left = blockIdx.x*(blockDim.x * 2) + threadId;
     int right = left + blockDim.x;
 
-    s_min_data[threadId] = min(min_in[left], min_in[right]);
-    s_max_data[threadId] = max(max_in[left], max_in[right]);
+    // if right < n, then left < n so we should compute the min/max values
+    if(right < n)
+    {
+        s_min_data[threadId] = min(min_in[left], min_in[right]);
+        s_max_data[threadId] = max(max_in[left], max_in[right]);
+    }
+    // if left < n but right > n, then the left must be the best value
+    else if(left < n)
+    {
+        s_min_data[threadId] = min_in[left];
+        s_max_data[threadId] = max_in[left];
+
+    }
     __syncthreads();
 
+    /*
+    Now we start with the shared memory data we just allocated, split it in half
+    and compare the values. Each iteration we cut the step in half.
+
+    Step 2: Repeat
+    [--------values ------]
+    [---step--][---step---]
+    [-reduced-]
+    */
     for(unsigned int step = blockDim.x / 2; step > 0; step >>= 1)
     {
         if(threadId < step)
@@ -119,20 +154,23 @@ void min_max_reduce_kernel(
         __syncthreads();
     }
 
+    /*
+    We reduced down to a single min/max value, so write that value to out.
+    We only need to do this once though
+    */
     if(threadId == 0)
     {
-        min_out[blockIdx.x] = s_min_data[threadId]; 
-        max_out[blockIdx.x] = s_max_data[threadId];
+        min_out[blockIdx.x] = s_min_data[0]; 
+        max_out[blockIdx.x] = s_max_data[0];
     }
 }
 
-void reduce_min_max(const float* const d_logLuminance, 
-            const size_t numRows, const size_t numCols,
-            float& min_out, float& max_out)
+void reduce_min_max(
+    const float* const d_logLuminance, size_t length,
+    float& min_out, float& max_out)
 {
     size_t threads = 256;
     size_t maxBlocks = threads * 2;
-    size_t length = numRows * numCols;
     size_t blocks = (length + (maxBlocks - 1))/maxBlocks;
     size_t shmBytes = 2 * threads * sizeof(float);
 
@@ -153,10 +191,10 @@ void reduce_min_max(const float* const d_logLuminance,
     min_max_reduce_kernel<<<blocks, threads, shmBytes>>>(
         d_min_in, d_min_out, 
         d_max_in, d_max_out, 
-        length, threads);
+        length);
     checkKernelErrors();
 
-    while(blocks >= 1)
+    while(blocks > 1)
     {
         length = blocks;
         blocks = (length + ((threads*2) - 1))/(threads*2);
@@ -166,13 +204,8 @@ void reduce_min_max(const float* const d_logLuminance,
         min_max_reduce_kernel<<<blocks, threads, shmBytes>>>(
             d_min_in, d_min_out, 
             d_max_in, d_max_out, 
-            length, threads);
+            length);
         checkKernelErrors();
-
-        if(blocks == 1)
-        {
-            break;
-        }
     }
 
     float min, max;
@@ -188,19 +221,80 @@ void reduce_min_max(const float* const d_logLuminance,
     max_out = max;
 }
 
-// #include <thrust/device_vector.h>
-// #include <thrust/transform_reduce.h>
-// #include <thrust/extrema.h>
-// float thrust_min(const float* const d_in, const size_t length)
-// {
-//     thrust::device_vector<float> d_x(d_in, d_in + length);
-//     return *thrust::min_element(d_x.begin(), d_x.end());
-// }
-// float thrust_max(const float* const d_in, const size_t length)
-// {
-//     thrust::device_vector<float> d_x(d_in, d_in + length);
-//     return *thrust::max_element(d_x.begin(), d_x.end());
-// }
+__global__
+void histogram_kernel(
+    const float* in, size_t n,
+    unsigned int* const out, size_t bins,
+    float lumMin, float lumRange)
+{
+    int index = blockIdx.x*(blockDim.x) + threadIdx.x;
+    int bin = ((in[index] - lumMin) / lumRange) * bins;
+    atomicAdd(out+bin, 1);
+}
+
+void generate_histogram(
+    const float* const d_in, size_t length,
+    unsigned int * const d_histogram, size_t numBins,
+    float lumMin, float lumMax)
+{
+    size_t threads = 256;
+    size_t blocks = (length + (threads - 1))/threads;
+
+    histogram_kernel<<<blocks, threads>>>(d_in, length, d_histogram, numBins, lumMin, lumMax-lumMin);
+    checkKernelErrors();
+}
+
+__global__
+void exclusive_sum_scan_kernel(unsigned int* const in, size_t length)
+{
+    extern __shared__ unsigned int temp[];
+
+    int threadId = threadIdx.x;
+    if(threadId < length)
+    {
+        return;
+    }
+
+    int index = 2 * threadId;
+    temp[index] = in[index];
+    temp[index+1] = in[index+1];
+    __syncthreads();
+}
+
+void exclusive_sum_scan(unsigned int* const d_in, size_t length)
+{
+    size_t threads = 256;
+    size_t blocks = (length + (threads - 1))/threads;
+    size_t shared = 2 * threads * sizeof(unsigned int);
+
+    exclusive_sum_scan_kernel<<<blocks, threads, shared>>>(d_in, length);
+    checkKernelErrors();
+
+    addition_kernel<<<>>>(d_in, d_sums, length);
+}
+
+#include <thrust/scan.h>
+#include <thrust/device_vector.h>
+#include <thrust/transform_reduce.h>
+#include <thrust/extrema.h>
+float thrust_min(const float* const d_in, const size_t length)
+{
+    thrust::device_vector<float> d_x(d_in, d_in + length);
+    return *thrust::min_element(d_x.begin(), d_x.end());
+}
+
+float thrust_max(const float* const d_in, const size_t length)
+{
+    thrust::device_vector<float> d_x(d_in, d_in + length);
+    return *thrust::max_element(d_x.begin(), d_x.end());
+}
+
+void thrust_exclusive_scan(
+    unsigned int* const d_in, int length)
+{
+    thrust::device_vector<unsigned int> d_data(d_in, d_in + length);
+    thrust::exclusive_scan(d_data.begin(), d_data.end(), thrust::device_ptr<unsigned int>(d_in));
+}
 
 void your_histogram_and_prefixsum(const float* const d_logLuminance,
                                   unsigned int* const d_cdf,
@@ -221,7 +315,14 @@ void your_histogram_and_prefixsum(const float* const d_logLuminance,
        the cumulative distribution of luminance values (this should go in the
        incoming d_cdf pointer which already has been allocated for you)       */
 
-    reduce_min_max(d_logLuminance, numRows, numCols, min_logLum, max_logLum);
-    printf("min: %f max: %f\n", min_logLum, max_logLum);
-    // printf("max: %f max: %f\n", thrust_min(d_logLuminance, numRows * numCols), thrust_max(d_logLuminance, numRows * numCols)); 
+    reduce_min_max(d_logLuminance, numRows*numCols, min_logLum, max_logLum);
+    // min_logLum = thrust_min(d_logLuminance, numRows*numCols);
+    // max_logLum = thrust_max(d_logLuminance, numRows*numCols);
+    // // printf("min: %f max: %f\n", min_logLum, max_logLum);
+    // // printf("max: %f max: %f\n", thrust_min(d_logLuminance, numRows * numCols), thrust_max(d_logLuminance, numRows * numCols)); 
+    
+    generate_histogram(d_logLuminance, numRows*numCols, d_cdf, numBins, min_logLum, max_logLum);
+
+    exclusive_sum_scan(d_cdf, numBins);
+    // thrust_exclusive_scan(d_cdf, numBins);
 }
