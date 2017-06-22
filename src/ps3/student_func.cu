@@ -249,7 +249,8 @@ void exclusive_sum_scan_kernel(unsigned int* const in, unsigned int* const sums,
     extern __shared__ unsigned int temp[];
 
     /*
-    shared memory size: 2 * #threads
+    shared memory size: 2 * threads,
+    copy data to shared memory
     */
     int localIndex = 2 * threadIdx.x;
     int globalIndex = 2 * blockDim.x * blockIdx.x + localIndex;
@@ -257,44 +258,57 @@ void exclusive_sum_scan_kernel(unsigned int* const in, unsigned int* const sums,
     temp[localIndex] = in[globalIndex];
     temp[localIndex+1] = in[globalIndex+1];
 
+    /*
+    The reduction phase.
+    */
     int offset = 1;
     for(int d = blockDim.x; d > 0; d = d/2)
     {
         __syncthreads();
         if(threadIdx.x < d)
         {
-            int index1 = offset * (localIndex+1) - 1;
-            int index2 = offset * (localIndex+2) - 1;
+            int first = offset * (localIndex+1) - 1;
+            int next = offset * (localIndex+2) - 1;
 
-            temp[index2] = temp[index2] + temp[index1];
+            temp[next] = temp[next] + temp[first];
         }
         offset *= 2;
     }
 
+    /*
+    copy the last element sum to the sums array, and set it to 0 for the
+    downsweep phase
+    */
     if(threadIdx.x == 0)
     {
+        // sums is NULL when we are scanning the sums array
         if(sums)
             sums[blockIdx.x] = temp[length-1];
         temp[length - 1] = 0;
     }
 
+    /*
+    The upsweep phase
+    */
     for(int d = 1; d < blockDim.x*2; d*=2)
     {
         offset /= 2;
         __syncthreads();
         if(threadIdx.x < d)
         {
-            int index1 = offset * (localIndex+1) - 1;
-            int index2 = offset * (localIndex+2) - 1;
+            int first = offset * (localIndex+1) - 1;
+            int next = offset * (localIndex+2) - 1;
 
-            unsigned int t = temp[index1];
-            temp[index1] = temp[index2];
-            temp[index2] = temp[index2] + t;
+            unsigned int t = temp[first];
+            temp[first] = temp[next];
+            temp[next] = temp[next] + t;
         }
     }
-
     __syncthreads();
 
+    /*
+    store values back to input
+    */
     in[globalIndex] = temp[localIndex];
     in[globalIndex+1] = temp[localIndex+1];
 }
@@ -321,12 +335,15 @@ void exclusive_sum_scan(unsigned int* const d_in, size_t length)
     checkCudaErrors(cudaMalloc(&d_sums, blocks * sizeof(unsigned int)));
     checkCudaErrors(cudaMemset(d_sums, 0, blocks * sizeof(unsigned int)));
 
+    // scan the input, outputs an array of sums, one for each block
     exclusive_sum_scan_kernel<<<blocks, threads/2, shared>>>(d_in, d_sums, threads);
     checkKernelErrors();
 
+    // scan the sums
     exclusive_sum_scan_kernel<<<1, threads/2, shared>>>(d_sums, NULL, threads);
     checkKernelErrors();
 
+    // add the sum for each block to the inputs in that block
     sum_scan_addition_kernel<<<blocks, threads>>>(d_in, d_sums, length);
     checkKernelErrors();
 
