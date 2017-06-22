@@ -1,0 +1,9 @@
+
+def build(bld):
+    bld(
+        features='cxx cxxprogram',
+        uselib=['OPENCV', 'CUDA', 'CUDART'],
+        source=bld.path.ant_glob('*.cpp') + bld.path.ant_glob('*.cu'),
+        includes=['.'],
+        target='PS1',
+    )

@@ -12,3 +12,6 @@ HW3
 HW3_*.png
 
 *.sublime-*
+
+*.build
+*.lock-*

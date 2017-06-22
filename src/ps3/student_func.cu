@@ -6,7 +6,7 @@
 
   A High Dynamic Range (HDR) image contains a wider variation of intensity
   and color than is allowed by the RGB format with 1 byte per channel that we
-  have used in the previous assignment.  
+  have used in the previous assignment.
 
   To store this extra information we use single precision floating point for
   each channel.  This allows for an extremely wide range of intensity values.
@@ -53,7 +53,7 @@
   Old TV signals used to be transmitted in this way so that black & white
   televisions could display the luminance channel while color televisions would
   display all three of the channels.
-  
+
 
   Tone-mapping
   ============
@@ -79,7 +79,6 @@
 
 */
 #include "utils.h"
-#include <stdio.h>
 
 void checkKernelErrors()
 {
@@ -89,15 +88,15 @@ void checkKernelErrors()
 
 __global__
 void min_max_reduce_kernel(
-    const float* min_in, float* min_out, 
-    const float* max_in, float* max_out, 
+    const float* min_in, float* min_out,
+    const float* max_in, float* max_out,
     const size_t n)
 {
     extern __shared__ float s_data[];
 
     /*
     shared memory size: 2 * #threads
-    
+
     [------------------shared memory---------------------]
     [--------min data---------][--------max data---------]
     */
@@ -160,7 +159,7 @@ void min_max_reduce_kernel(
     */
     if(threadId == 0)
     {
-        min_out[blockIdx.x] = s_min_data[0]; 
+        min_out[blockIdx.x] = s_min_data[0];
         max_out[blockIdx.x] = s_max_data[0];
     }
 }
@@ -189,8 +188,8 @@ void reduce_min_max(
     checkCudaErrors(cudaMemset(d_max_out, 0.0f, blocks * sizeof(float)));
 
     min_max_reduce_kernel<<<blocks, threads, shmBytes>>>(
-        d_min_in, d_min_out, 
-        d_max_in, d_max_out, 
+        d_min_in, d_min_out,
+        d_max_in, d_max_out,
         length);
     checkKernelErrors();
 
@@ -202,8 +201,8 @@ void reduce_min_max(
         checkCudaErrors(cudaMemcpy(d_max_in, d_max_out, length * sizeof(float), cudaMemcpyDeviceToDevice));
 
         min_max_reduce_kernel<<<blocks, threads, shmBytes>>>(
-            d_min_in, d_min_out, 
-            d_max_in, d_max_out, 
+            d_min_in, d_min_out,
+            d_max_in, d_max_out,
             length);
         checkKernelErrors();
     }
@@ -245,56 +244,117 @@ void generate_histogram(
 }
 
 __global__
-void exclusive_sum_scan_kernel(unsigned int* const in, size_t length)
+void exclusive_sum_scan_kernel(unsigned int* const in, unsigned int* const sums, size_t length)
 {
     extern __shared__ unsigned int temp[];
 
-    int threadId = threadIdx.x;
-    if(threadId < length)
+    /*
+    shared memory size: 2 * #threads
+    */
+    int localIndex = 2 * threadIdx.x;
+    int globalIndex = 2 * blockDim.x * blockIdx.x + localIndex;
+
+    temp[localIndex] = in[globalIndex];
+    temp[localIndex+1] = in[globalIndex+1];
+
+    int offset = 1;
+    for(int d = blockDim.x; d > 0; d = d/2)
     {
-        return;
+        __syncthreads();
+        if(threadIdx.x < d)
+        {
+            int index1 = offset * (localIndex+1) - 1;
+            int index2 = offset * (localIndex+2) - 1;
+
+            temp[index2] = temp[index2] + temp[index1];
+        }
+        offset *= 2;
     }
 
-    int index = 2 * threadId;
-    temp[index] = in[index];
-    temp[index+1] = in[index+1];
+    if(threadIdx.x == 0)
+    {
+        if(sums)
+            sums[blockIdx.x] = temp[length-1];
+        temp[length - 1] = 0;
+    }
+
+    for(int d = 1; d < blockDim.x*2; d*=2)
+    {
+        offset /= 2;
+        __syncthreads();
+        if(threadIdx.x < d)
+        {
+            int index1 = offset * (localIndex+1) - 1;
+            int index2 = offset * (localIndex+2) - 1;
+
+            unsigned int t = temp[index1];
+            temp[index1] = temp[index2];
+            temp[index2] = temp[index2] + t;
+        }
+    }
+
     __syncthreads();
+
+    in[globalIndex] = temp[localIndex];
+    in[globalIndex+1] = temp[localIndex+1];
+}
+
+__global__
+void sum_scan_addition_kernel(unsigned int* const in, unsigned int* sums, size_t length)
+{
+    int index = blockDim.x * blockIdx.x + threadIdx.x;
+    int sumIndex = blockIdx.x;
+
+    if(index < length)
+    {
+        in[index] = in[index] + sums[sumIndex];
+    }
 }
 
 void exclusive_sum_scan(unsigned int* const d_in, size_t length)
 {
-    size_t threads = 256;
+    size_t threads = 1024;
     size_t blocks = (length + (threads - 1))/threads;
-    size_t shared = 2 * threads * sizeof(unsigned int);
+    size_t shared = threads * sizeof(unsigned int);
 
-    exclusive_sum_scan_kernel<<<blocks, threads, shared>>>(d_in, length);
+    unsigned int* d_sums = NULL;
+    checkCudaErrors(cudaMalloc(&d_sums, blocks * sizeof(unsigned int)));
+    checkCudaErrors(cudaMemset(d_sums, 0, blocks * sizeof(unsigned int)));
+
+    exclusive_sum_scan_kernel<<<blocks, threads/2, shared>>>(d_in, d_sums, threads);
     checkKernelErrors();
 
-    addition_kernel<<<>>>(d_in, d_sums, length);
+    exclusive_sum_scan_kernel<<<1, threads/2, shared>>>(d_sums, NULL, threads);
+    checkKernelErrors();
+
+    sum_scan_addition_kernel<<<blocks, threads>>>(d_in, d_sums, length);
+    checkKernelErrors();
+
+    checkCudaErrors(cudaFree(d_sums));
 }
 
-#include <thrust/scan.h>
-#include <thrust/device_vector.h>
-#include <thrust/transform_reduce.h>
-#include <thrust/extrema.h>
-float thrust_min(const float* const d_in, const size_t length)
-{
-    thrust::device_vector<float> d_x(d_in, d_in + length);
-    return *thrust::min_element(d_x.begin(), d_x.end());
-}
+// #include <thrust/scan.h>
+// #include <thrust/device_vector.h>
+// #include <thrust/transform_reduce.h>
+// #include <thrust/extrema.h>
+// float thrust_min(const float* const d_in, const size_t length)
+// {
+//     thrust::device_vector<float> d_x(d_in, d_in + length);
+//     return *thrust::min_element(d_x.begin(), d_x.end());
+// }
 
-float thrust_max(const float* const d_in, const size_t length)
-{
-    thrust::device_vector<float> d_x(d_in, d_in + length);
-    return *thrust::max_element(d_x.begin(), d_x.end());
-}
+// float thrust_max(const float* const d_in, const size_t length)
+// {
+//     thrust::device_vector<float> d_x(d_in, d_in + length);
+//     return *thrust::max_element(d_x.begin(), d_x.end());
+// }
 
-void thrust_exclusive_scan(
-    unsigned int* const d_in, int length)
-{
-    thrust::device_vector<unsigned int> d_data(d_in, d_in + length);
-    thrust::exclusive_scan(d_data.begin(), d_data.end(), thrust::device_ptr<unsigned int>(d_in));
-}
+// void thrust_exclusive_scan(
+//     unsigned int* const d_in, int length)
+// {
+//     thrust::device_vector<unsigned int> d_data(d_in, d_in + length);
+//     thrust::exclusive_scan(d_data.begin(), d_data.end(), thrust::device_ptr<unsigned int>(d_in));
+// }
 
 void your_histogram_and_prefixsum(const float* const d_logLuminance,
                                   unsigned int* const d_cdf,
@@ -318,9 +378,7 @@ void your_histogram_and_prefixsum(const float* const d_logLuminance,
     reduce_min_max(d_logLuminance, numRows*numCols, min_logLum, max_logLum);
     // min_logLum = thrust_min(d_logLuminance, numRows*numCols);
     // max_logLum = thrust_max(d_logLuminance, numRows*numCols);
-    // // printf("min: %f max: %f\n", min_logLum, max_logLum);
-    // // printf("max: %f max: %f\n", thrust_min(d_logLuminance, numRows * numCols), thrust_max(d_logLuminance, numRows * numCols)); 
-    
+
     generate_histogram(d_logLuminance, numRows*numCols, d_cdf, numBins, min_logLum, max_logLum);
 
     exclusive_sum_scan(d_cdf, numBins);

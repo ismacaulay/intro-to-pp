@@ -1,3 +1,5 @@
+#pragma once
+
 #include <opencv2/core/core.hpp>
 #include <opencv2/highgui/highgui.hpp>
 #include <opencv2/opencv.hpp>
@@ -120,7 +122,7 @@ void cleanUp(void)
 }
 
 
-// An unused bit of code showing how to accomplish this assignment using OpenCV.  It is much faster 
+// An unused bit of code showing how to accomplish this assignment using OpenCV.  It is much faster
 //    than the naive implementation in reference_calc.cpp.
 void generateReferenceImage(std::string input_file, std::string reference_file, int kernel_size)
 {
